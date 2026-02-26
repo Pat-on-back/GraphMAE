@@ -29,88 +29,145 @@ import timeit
 
 def compute_accuracy(pred, target):
     return float(torch.sum(torch.max(pred.detach(), dim = 1)[1] == target).cpu().item())/len(pred)
-
-
-
-
+    
 def sce_loss(x, y, alpha=1):
+    
+    # 对输入向量做 L2 归一化
+    # 消除向量长度影响，只比较方向（角度相似度）
+    # 防止特征尺度不同导致训练不稳定
     x = F.normalize(x, p=2, dim=-1)
     y = F.normalize(y, p=2, dim=-1)
-
-    # loss =  - (x * y).sum(dim=-1)
-    # loss = (x_h - y_h).norm(dim=1).pow(alpha)
-
+    
+    # 通过将余弦误差乘以一个幂次 alpha ≥1
+    # 可以降低简单样本在训练中的贡献。
     loss = (1 - (x * y).sum(dim=-1)).pow_(alpha)
-
     loss = loss.mean()
     return loss
 
 
 def train_mae(args, model_list, loader, optimizer_list, device, alpha_l=1.0, loss_fn="sce"):
+    """
+    Graph Masked AutoEncoder 单轮训练函数（训练一个epoch）
+
+    参数说明：
+    args                : 配置对象（包含是否mask边等参数）
+    model_list          : 模型列表 [encoder, 节点decoder, 边decoder]
+    loader              : 数据加载器（返回图batch）
+    optimizer_list      : 优化器列表（分别对应三个模型）
+    device              : 训练设备（cpu或cuda）
+    alpha_l             : SCE损失指数参数
+    loss_fn             : 损失函数类型 "sce" 或 "ce"
+    """
+
+    # 选择损失函数
     if loss_fn == "sce":
+        # partial作用：固定alpha参数，生成新函数
+        # 等价于 lambda x,y: sce_loss(x,y,alpha=alpha_l)
         criterion = partial(sce_loss, alpha=alpha_l)
     else:
+        # 如果不是sce，则使用分类损失函数
         criterion = nn.CrossEntropyLoss()
 
+    # 解包模型
+    # model               -> encoder
+    # dec_pred_atoms      -> 节点预测decoder
+    # dec_pred_bonds      -> 边预测decoder（可能为None）
     model, dec_pred_atoms, dec_pred_bonds = model_list
-    optimizer_model, optimizer_dec_pred_atoms, optimizer_dec_pred_bonds = optimizer_list
     
-    model.train()
-    dec_pred_atoms.train()
-
+    # 解包优化器
+    optimizer_model, optimizer_dec_pred_atoms, optimizer_dec_pred_bonds = optimizer_list
+    model.train()                 # encoder启用训练模式
+    dec_pred_atoms.train()        # 节点decoder训练模式
+    # 若存在边decoder，则也切换
     if dec_pred_bonds is not None:
         dec_pred_bonds.train()
 
-    loss_accum = 0
-    acc_node_accum = 0
-    acc_edge_accum = 0
+    # 初始化统计变量
+    loss_accum = 0         # 累计loss
+    acc_node_accum = 0     # 节点准确率累计（当前未使用）
+    acc_edge_accum = 0     # 边准确率累计（当前未使用）
 
     epoch_iter = tqdm(loader, desc="Iteration")
+    
+    # 主训练循环
     for step, batch in enumerate(epoch_iter):
         batch = batch.to(device)
+
+        # Encoder前向传播
+        # 输入：
+        #   batch.x            节点特征
+        #   batch.edge_index   边索引
+        #   batch.edge_attr    边属性
+        # 输出：
+        #  node_rep shape = [节点数, hidden_dim]
         node_rep = model(batch.x, batch.edge_index, batch.edge_attr)
 
-        ## loss for nodes
+        # 节点mask重建任务
+        # 节点真实标签（监督信号）
         node_attr_label = batch.node_attr_label
+        # 被mask节点索引
         masked_node_indices = batch.masked_atom_indices
-        pred_node = dec_pred_atoms(node_rep, batch.edge_index, batch.edge_attr, masked_node_indices)
-        # loss = criterion(pred_node.double(), batch.mask_node_label[:,0])
+
+        # decoder预测节点属性
+        # 输出shape = [节点数, out_dim]
+        pred_node = dec_pred_atoms(
+            node_rep,
+            batch.edge_index,
+            batch.edge_attr,
+            masked_node_indices
+        )
+
+        # ---------- 根据loss类型计算节点loss ----------
         if loss_fn == "sce":
-            loss = criterion(node_attr_label, pred_node[masked_node_indices])
+            # SCE损失：比较向量方向
+            # 只计算被mask节点
+            loss = criterion(
+                node_attr_label,
+                pred_node[masked_node_indices]
+            )
         else:
-            loss = criterion(pred_node.double()[masked_node_indices], batch.mask_node_label[:,0])
+            # CrossEntropy分类损失
+            # pred_node.double() -> 转为float64防止精度问题
+            # mask_node_label[:,0] -> 从[M,1]转为[M]
+            loss = criterion(
+                pred_node.double()[masked_node_indices],
+                batch.mask_node_label[:,0]
+            )
 
-        # acc_node = compute_accuracy(pred_node, batch.mask_node_label[:,0])
-        # acc_node_accum += acc_node
-
+        # 边mask重建任务（可选）
         if args.mask_edge:
+            # 取出被mask的边索引
             masked_edge_index = batch.edge_index[:, batch.connected_edge_indices]
-            edge_rep = node_rep[masked_edge_index[0]] + node_rep[masked_edge_index[1]]
+            # 构造边表示，两端节点embedding相加
+            edge_rep = (
+                node_rep[masked_edge_index[0]] +
+                node_rep[masked_edge_index[1]]
+            )
+            # 边decoder预测
             pred_edge = dec_pred_bonds(edge_rep)
-            loss += criterion(pred_edge.double(), batch.mask_edge_label[:,0])
-
-            # acc_edge = compute_accuracy(pred_edge, batch.mask_edge_label[:,0])
-            # acc_edge_accum += acc_edge
-
+            # 将边loss加入总loss
+            loss += criterion(
+                pred_edge.double(),
+                batch.mask_edge_label[:,0]
+            )
         optimizer_model.zero_grad()
         optimizer_dec_pred_atoms.zero_grad()
 
         if optimizer_dec_pred_bonds is not None:
             optimizer_dec_pred_bonds.zero_grad()
-
         loss.backward()
-
-        optimizer_model.step()
-        optimizer_dec_pred_atoms.step()
+        optimizer_model.step()               # 更新encoder参数
+        optimizer_dec_pred_atoms.step()      # 更新节点decoder参数
 
         if optimizer_dec_pred_bonds is not None:
-            optimizer_dec_pred_bonds.step()
+            optimizer_dec_pred_bonds.step()  # 更新边decoder参数
 
         loss_accum += float(loss.cpu().item())
-        epoch_iter.set_description(f"train_loss: {loss.item():.4f}")
-
-    return loss_accum/step #, acc_node_accum/step, acc_edge_accum/step
-
+        # 更新进度条显示当前loss
+        epoch_iter.set_description(
+            f"train_loss: {loss.item():.4f}"
+        )
+    return loss_accum/step
 
 
 def main():
