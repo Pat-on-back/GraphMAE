@@ -187,55 +187,52 @@ def reset_idxes(G):
     return new_G, mapping
 
 
-# TODO(Bowen): more unittests
 class MaskAtom:
     def __init__(self, num_atom_type, num_edge_type, mask_rate, mask_edge=True):
         """
-        Randomly masks an atom, and optionally masks edges connecting to it.
-        The mask atom type index is num_possible_atom_type
-        The mask edge type index in num_possible_edge_type
-        :param num_atom_type:
-        :param num_edge_type:
-        :param mask_rate: % of atoms to be masked
-        :param mask_edge: If True, also mask the edges that connect to the
-        masked atoms
+        随机对原子进行mask，也可以对与该原子相连的边进行mask。
+        num_atom_type 和 num_edge_type：表示分子图的节点（原子）和边（化学键）的可能类型总数，
+        用于 one-hot 编码和 mask 值。
+        :param num_atom_type: 原子类别总数
+        :param num_edge_type: 边类别总数
+        :param mask_rate: 被mask的原子占比
+        :param mask_edge: 是否对连接的边也进行mask
+        
         """
         self.num_atom_type = num_atom_type
         self.num_edge_type = num_edge_type
         self.mask_rate = mask_rate
         self.mask_edge = mask_edge
-        
+
+        # 手性标签数量（如 R/S/未指定）
         self.num_chirality_tag = 3
+        # 边的方向数量（如顺/逆/未指定）
         self.num_bond_direction = 3 
 
 
     def __call__(self, data, masked_atom_indices=None):
         """
-
-        :param data: pytorch geometric data object. Assume that the edge
-        ordering is the default pytorch geometric ordering, where the two
-        directions of a single edge occur in pairs.
-        Eg. data.edge_index = tensor([[0, 1, 1, 2, 2, 3],
+        :param data: PyTorch Geometric 数据对象。假设边的顺序是默认的 PyTorch Geometric 顺序，
+        即单条边的两个方向成对出现。
+        例如：data.edge_index = tensor([[0, 1, 1, 2, 2, 3],
                                      [1, 0, 2, 1, 3, 2]])
-        :param masked_atom_indices: If None, then randomly samples num_atoms
-        * mask rate number of atom indices
-        Otherwise a list of atom idx that sets the atoms to be masked (for
-        debugging only)
-        :return: None, Creates new attributes in original data object:
-        data.mask_node_idx
-        data.mask_node_label
-        data.mask_edge_idx
-        data.mask_edge_label
+        :param masked_atom_indices: 如果为 None，则随机采样 num_atoms * mask_rate 数量的
+        原子索引；否则使用给定的原子索引列表来设置要掩码的原子（仅用于调试）
+        :return: None，在原始数据对象中创建新属性：
+        data.mask_node_idx（掩码节点索引）
+        data.mask_node_label（掩码节点标签）
+        data.mask_edge_idx（掩码边索引）
+        data.mask_edge_label（掩码边标签）
         """
 
         if masked_atom_indices == None:
-            # sample x distinct atoms to be masked, based on mask rate. But
-            # will sample at least 1 atom
+            # 计算节点总数
             num_atoms = data.x.size()[0]
+            # 至少掩码1个
             sample_size = int(num_atoms * self.mask_rate + 1)
             masked_atom_indices = random.sample(range(num_atoms), sample_size)
 
-        # create mask node label by copying atom feature of mask atom
+        # 为每个被 mask 的节点复制原始特征，作为预测标签。
         mask_node_labels_list = []
         for atom_idx in masked_atom_indices:
             mask_node_labels_list.append(data.x[atom_idx].view(1, -1))
@@ -243,18 +240,18 @@ class MaskAtom:
         data.masked_atom_indices = torch.tensor(masked_atom_indices)
 
         # ----------- graphMAE -----------
+        # 原子类型列-one-hot，最终生成 data.node_attr_label 作为模型预测目标。
         atom_type = F.one_hot(data.mask_node_label[:, 0], num_classes=self.num_atom_type).float()
         atom_chirality = F.one_hot(data.mask_node_label[:, 1], num_classes=self.num_chirality_tag).float()
         # data.node_attr_label = torch.cat((atom_type,atom_chirality), dim=1)
         data.node_attr_label = atom_type
 
-        # modify the original node feature of the masked node
+        # 修改原节点特征以进行 mask
         for atom_idx in masked_atom_indices:
             data.x[atom_idx] = torch.tensor([self.num_atom_type, 0])
 
         if self.mask_edge:
-            # create mask edge labels by copying edge features of edges that are bonded to
-            # mask atoms
+            # 找出与被 mask 节点相连的所有边，保存所有相关边索引
             connected_edge_indices = []
             for bond_idx, (u, v) in enumerate(data.edge_index.cpu().numpy().T):
                 for atom_idx in masked_atom_indices:
@@ -263,35 +260,37 @@ class MaskAtom:
                         connected_edge_indices.append(bond_idx)
 
             if len(connected_edge_indices) > 0:
-                # create mask edge labels by copying bond features of the bonds connected to
-                # the mask atoms
+                # 复制边特征作为标签
                 mask_edge_labels_list = []
-                for bond_idx in connected_edge_indices[::2]: # because the
-                    # edge ordering is such that two directions of a single
-                    # edge occur in pairs, so to get the unique undirected
-                    # edge indices, we take every 2nd edge index from list
+                for bond_idx in connected_edge_indices[::2]: # 因为边的顺序是这样的：单条边的两个方向成对出现，
+                    # 所以为了获取唯一的无向边索引，我们从列表中每隔一个边索引取一个。
                     mask_edge_labels_list.append(
                         data.edge_attr[bond_idx].view(1, -1))
 
                 data.mask_edge_label = torch.cat(mask_edge_labels_list, dim=0)
-                # modify the original bond features of the bonds connected to the mask atoms
+                # 修改原边特征（mask）对 mask 边设置特殊值：
+                # 边类型 = num_edge_type，边方向 = 0
                 for bond_idx in connected_edge_indices:
                     data.edge_attr[bond_idx] = torch.tensor(
                         [self.num_edge_type, 0])
-
+                    
+                # 仅保存去重后的边索引。
                 data.connected_edge_indices = torch.tensor(
                     connected_edge_indices[::2])
+                
+            # 如果没有与 mask 节点相连的边，则生成空 tensor。
             else:
                 data.mask_edge_label = torch.empty((0, 2)).to(torch.int64)
                 data.connected_edge_indices = torch.tensor(
                     connected_edge_indices).to(torch.int64)
-
+            # edge one-hot 编码
             edge_type = F.one_hot(data.mask_edge_label[:, 0], num_classes=self.num_edge_type).float()
             bond_direction = F.one_hot(data.mask_edge_label[:, 1], num_classes=self.num_bond_direction).float()
             data.edge_attr_label = torch.cat((edge_type, bond_direction), dim=1)
             # data.edge_attr_label = edge_type
 
         return data
+
 
     def __repr__(self):
         return '{}(num_atom_type={}, num_edge_type={}, mask_rate={}, mask_edge={})'.format(
