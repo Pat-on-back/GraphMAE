@@ -58,23 +58,13 @@ def train_mae(args, model_list, loader, optimizer_list, device, alpha_l=1.0, los
     alpha_l             : SCE损失指数参数
     loss_fn             : 损失函数类型 "sce" 或 "ce"
     """
-
-    # 选择损失函数
     if loss_fn == "sce":
-        # partial作用：固定alpha参数，生成新函数
-        # 等价于 lambda x,y: sce_loss(x,y,alpha=alpha_l)
         criterion = partial(sce_loss, alpha=alpha_l)
     else:
-        # 如果不是sce，则使用分类损失函数
         criterion = nn.CrossEntropyLoss()
-
-    # 解包模型
-    # model               -> encoder
-    # dec_pred_atoms      -> 节点预测decoder
-    # dec_pred_bonds      -> 边预测decoder（可能为None）
+        
+    # model 编码器，dec_pred_atoms 节点(原子)特征，边（化学键）特征解码器
     model, dec_pred_atoms, dec_pred_bonds = model_list
-    
-    # 解包优化器
     optimizer_model, optimizer_dec_pred_atoms, optimizer_dec_pred_bonds = optimizer_list
     model.train()                 # encoder启用训练模式
     dec_pred_atoms.train()        # 节点decoder训练模式
@@ -83,23 +73,17 @@ def train_mae(args, model_list, loader, optimizer_list, device, alpha_l=1.0, los
         dec_pred_bonds.train()
 
     # 初始化统计变量
-    loss_accum = 0         # 累计loss
-    acc_node_accum = 0     # 节点准确率累计（当前未使用）
-    acc_edge_accum = 0     # 边准确率累计（当前未使用）
-
+    loss_accum = 0        
+    acc_node_accum = 0    
+    acc_edge_accum = 0  
+    
+    # lodaer加载了初次掩码的节点特征和边特征
     epoch_iter = tqdm(loader, desc="Iteration")
     
     # 主训练循环
     for step, batch in enumerate(epoch_iter):
         batch = batch.to(device)
-
-        # Encoder前向传播
-        # 输入：
-        #   batch.x            节点特征
-        #   batch.edge_index   边索引
-        #   batch.edge_attr    边属性
-        # 输出：
-        #  node_rep shape = [节点数, hidden_dim]
+        
         node_rep = model(batch.x, batch.edge_index, batch.edge_attr)
 
         # 节点mask重建任务
@@ -169,9 +153,8 @@ def train_mae(args, model_list, loader, optimizer_list, device, alpha_l=1.0, los
         )
     return loss_accum/step
 
-
 def main():
-    # Training settings
+    # 配置参数
     parser = argparse.ArgumentParser(description='PyTorch implementation of pre-training of graph neural networks')
     parser.add_argument('--device', type=int, default=0,
                         help='which gpu to use if any (default: 0)')
@@ -182,7 +165,7 @@ def main():
     parser.add_argument('--lr', type=float, default=0.001,
                         help='learning rate (default: 0.001)')
     parser.add_argument('--decay', type=float, default=0,
-                        help='weight decay (default: 0)')
+                        help='weight decay (default: 0)') 
     parser.add_argument('--num_layer', type=int, default=5,
                         help='number of GNN message passing layers (default: 5).')
     parser.add_argument('--emb_dim', type=int, default=300,
@@ -193,8 +176,10 @@ def main():
                         help='dropout ratio (default: 0.15)')
     parser.add_argument('--mask_edge', type=int, default=0,
                         help='whether to mask edges or not together with atoms')
+    
+    # JK = Jumping Knowledge 控制多层特征融合方式
     parser.add_argument('--JK', type=str, default="last",
-                        help='how the node features are combined across layers. last, sum, max or concat')
+                        help='how the node features are combined across layers. last, sum, max or concat') 
     parser.add_argument('--dataset', type=str, default = 'zinc_standard_agent', help='root directory of dataset for pretraining')
     parser.add_argument('--output_model_file', type=str, default = '', help='filename to output the model')
     parser.add_argument('--gnn_type', type=str, default="gin")
@@ -207,7 +192,8 @@ def main():
     parser.add_argument("--use_scheduler", action="store_true", default=False)
     args = parser.parse_args()
     print(args)
-
+    
+    # 固定随机种子（保证实验可复现）
     torch.manual_seed(0)
     np.random.seed(0)
     device = torch.device("cuda:" + str(args.device)) if torch.cuda.is_available() else torch.device("cpu")
@@ -215,15 +201,17 @@ def main():
         torch.cuda.manual_seed_all(0)
 
     print("num layer: %d mask rate: %f mask edge: %d" %(args.num_layer, args.mask_rate, args.mask_edge))
-
-
     dataset_name = args.dataset
-    # set up dataset and transform function.
-    # dataset = MoleculeDataset("dataset/" + args.dataset, dataset=args.dataset, transform = MaskAtom(num_atom_type = 119, num_edge_type = 5, mask_rate = args.mask_rate, mask_edge=args.mask_edge))
     dataset = MoleculeDataset("dataset/" + dataset_name, dataset=dataset_name)
 
-    # loader = DataLoaderMasking(dataset, batch_size=args.batch_size, shuffle=True, num_workers = args.num_workers)
-    loader = DataLoaderMaskingPred(dataset, batch_size=args.batch_size, shuffle=True, num_workers = args.num_workers, mask_rate=args.mask_rate, mask_edge=args.mask_edge)
+    loader = DataLoaderMaskingPred(
+    dataset,                     # 数据集对象
+    batch_size=args.batch_size,  # 每批样本数量
+    shuffle=True,                # 每个 epoch 打乱数据顺序（防止过拟合顺序）
+    num_workers=args.num_workers,# 并行数据加载线程数
+    mask_rate=args.mask_rate,    # mask比例（节点被遮挡概率）
+    mask_edge=args.mask_edge     # 是否同时mask边
+)
 
     # set up models, one for pre-training and one for context embeddings
     model = GNN(args.num_layer, args.emb_dim, JK = args.JK, drop_ratio = args.dropout_ratio, gnn_type = args.gnn_type).to(device)
